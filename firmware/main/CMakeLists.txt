@@ -1,0 +1,32 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "bwave_config.c"
+        "bwave_csi.c"
+        "bwave_dsp.c"
+        "bwave_stream.c"
+        "bwave_sd.c"
+        "bwave_lcd.c"
+        "bwave_cmd.c"
+        "bwave_identity.c"
+        "bwave_ble.c"
+        "bwave_ble_gatt.c"
+        "bwave_cascade.c"
+        "bwave_httpd.c"
+        "bwave_slip.c"
+        "bwave_declared_screen.c"
+    INCLUDE_DIRS "."
+    REQUIRES
+        esp_wifi
+        esp_event
+        esp_timer
+        esp_netif
+        nvs_flash
+        driver
+        esp_lcd
+        fatfs
+        sdmmc
+        lwip
+        bt
+        esp_http_server
+)

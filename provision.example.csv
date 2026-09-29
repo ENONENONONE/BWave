@@ -1,0 +1,8 @@
+key,type,encoding,value
+bwave,namespace,,
+ssid,data,string,YOUR_SSID
+password,data,string,YOUR_PASSWORD
+target_ip,data,string,0.0.0.0
+target_port,data,u16,5005
+node_id,data,u8,1
+position,data,u16,0

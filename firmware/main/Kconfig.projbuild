@@ -1,0 +1,61 @@
+menu "BWave Configuration"
+
+    config BWAVE_WIFI_SSID
+        string "WiFi SSID (empty = provision via NVS)"
+        default ""
+
+    config BWAVE_WIFI_PASSWORD
+        string "WiFi Password"
+        default ""
+
+    config BWAVE_TARGET_IP
+        string "Aggregator IP (empty = provision via NVS)"
+        default ""
+
+    config BWAVE_TARGET_PORT
+        int "Aggregator UDP Port"
+        default 4200
+
+    config BWAVE_NODE_ID
+        int "Node ID (0=auto from MAC)"
+        default 0
+        range 0 255
+
+    config BWAVE_WIFI_CHANNEL
+        int "WiFi Channel"
+        default 6
+        range 1 14
+
+    config BWAVE_EDGE_TIER
+        int "Edge Processing Tier (0=raw, 1=basic, 2=full)"
+        default 2
+        range 0 2
+
+    config BWAVE_VITAL_INTERVAL_MS
+        int "Vitals packet interval (ms)"
+        default 1000
+        range 100 10000
+
+    config BWAVE_SD_LOGGING
+        bool "Enable SD card logging"
+        default y
+
+    config BWAVE_LCD_ENABLED
+        bool "Enable LCD display"
+        default y
+
+    config BWAVE_POSITION
+        int "BWave position (0 = unassigned)"
+        default 0
+        range 0 256
+        help
+            GF(257) position this node advertises. element = 3^position,
+            fold element = element^-1, ray = position mod 12,
+            fold dlog = 256 - position. 0 leaves every identity field 0.
+            Overridable at runtime via NVS namespace "bwave", key "position".
+
+    config BWAVE_BLE_NAME
+        string "BLE device name"
+        default "BWAVE"
+
+endmenu

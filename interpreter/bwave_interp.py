@@ -12,6 +12,7 @@ Packet magics (0xC511xxxx LE):
   0x09 = Brainwave bands (24 bytes)
   0x0A = Multi-person vitals
   0x0E = Doppler velocity (40 bytes)
+  0x0F = Resonance: Q, decrement, AM/PM (48 bytes)
 """
 
 import asyncio
@@ -39,6 +40,7 @@ MAGIC_BASELINE = 0xC5110008
 MAGIC_BRAIN    = 0xC5110009
 MAGIC_PERSON   = 0xC511000A
 MAGIC_DOPPLER  = 0xC511000E
+MAGIC_RESONANCE = 0xC511000F
 
 HISTORY_LEN = 300
 
@@ -56,6 +58,7 @@ class BWaveState:
         self.doppler = {}
         self.persons = []
         self.baseline = {}
+        self.resonance = {}
 
         self.amplitudes = []
         self.phases = []
@@ -69,6 +72,9 @@ class BWaveState:
         self.theta_history = deque(maxlen=HISTORY_LEN)
         self.alpha_history = deque(maxlen=HISTORY_LEN)
         self.amp_history = deque(maxlen=60)
+        self.br_q_history = deque(maxlen=HISTORY_LEN)
+        self.hr_q_history = deque(maxlen=HISTORY_LEN)
+        self.am_depth_history = deque(maxlen=HISTORY_LEN)
 
         self.ws_clients = set()
 
@@ -93,6 +99,8 @@ class BWaveState:
             self._parse_person(data)
         elif magic == MAGIC_DOPPLER:
             self._parse_doppler(data)
+        elif magic == MAGIC_RESONANCE:
+            self._parse_resonance(data)
 
     def _parse_csi(self, data):
         if len(data) < 26:
@@ -248,6 +256,55 @@ class BWaveState:
         }
         self._broadcast("doppler", self.doppler)
 
+    def _parse_resonance(self, data):
+        if len(data) < 48:
+            return
+        node_id = data[4]
+        if self.node_id and node_id != self.node_id:
+            return
+
+        flags = data[5]
+        ts_ms = struct.unpack_from("<H", data, 6)[0]
+        (br_f0, br_q, hr_f0, hr_q, br_dec, hr_dec,
+         am_depth, pm_index, am_f0, am_q) = struct.unpack_from("<10f", data, 8)
+
+        def q_from_decrement(d):
+            # exact for a damped tuned circuit: Q^2 = pi^2/delta^2 + 1/4
+            return round(math.sqrt(math.pi ** 2 / d ** 2 + 0.25), 2) if d > 0 else None
+
+        def peak(f0, q, valid, res_limited):
+            return {
+                "valid": valid,
+                "f0_hz": round(f0, 4),
+                "bpm": round(f0 * 60.0, 2),
+                "q": round(q, 2),
+                "res_limited": res_limited,
+            }
+
+        now = time.time()
+        self.resonance = {
+            "breathing": peak(br_f0, br_q, bool(flags & 0x01), bool(flags & 0x08)),
+            "heart": peak(hr_f0, hr_q, bool(flags & 0x02), bool(flags & 0x10)),
+            "am_breathing": peak(am_f0, am_q, bool(flags & 0x04), bool(flags & 0x40)),
+            "br_decrement": round(br_dec, 4),
+            "br_q_decrement": q_from_decrement(br_dec),
+            "hr_decrement": round(hr_dec, 4),
+            "hr_q_decrement": q_from_decrement(hr_dec),
+            "am_depth": round(am_depth, 4),
+            "pm_index": round(pm_index, 4),
+            "am_pm_agree": bool(flags & 0x20),
+            "timestamp_ms": ts_ms,
+            "updated": now,
+        }
+
+        if flags & 0x01:
+            self.br_q_history.append({"t": now, "v": round(br_q, 2)})
+        if flags & 0x02:
+            self.hr_q_history.append({"t": now, "v": round(hr_q, 2)})
+        self.am_depth_history.append({"t": now, "v": round(am_depth, 4)})
+
+        self._broadcast("resonance", self.resonance)
+
     def _parse_person(self, data):
         if len(data) < 8:
             return
@@ -328,6 +385,7 @@ class BWaveState:
             "doppler": self.doppler,
             "persons": self.persons,
             "baseline_n_sc": self.baseline.get("n_subcarriers", 0),
+            "resonance": self.resonance,
         }
 
 
@@ -376,6 +434,10 @@ async def handle_baseline(request):
     return web.json_response(state.baseline or {"error": "no data"})
 
 
+async def handle_resonance(request):
+    return web.json_response(state.resonance or {"error": "no data"})
+
+
 async def handle_history(request):
     which = request.match_info.get("series", "hr")
     histories = {
@@ -386,6 +448,9 @@ async def handle_history(request):
         "delta": state.delta_history,
         "theta": state.theta_history,
         "alpha": state.alpha_history,
+        "br_q": state.br_q_history,
+        "hr_q": state.hr_q_history,
+        "am_depth": state.am_depth_history,
     }
     h = histories.get(which)
     if h is None:
@@ -445,6 +510,7 @@ def main():
     app.router.add_get("/api/v1/doppler", handle_doppler)
     app.router.add_get("/api/v1/persons", handle_persons)
     app.router.add_get("/api/v1/baseline", handle_baseline)
+    app.router.add_get("/api/v1/resonance", handle_resonance)
     app.router.add_get("/api/v1/history/{series}", handle_history)
     app.router.add_get("/ws", handle_ws)
 

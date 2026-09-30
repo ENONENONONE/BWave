@@ -20,6 +20,10 @@ typedef struct {
     uint8_t  top_k_count;
     uint8_t  sd_logging;
     uint8_t  lcd_enabled;
+    float    br_q;        /* vital filter per-stage Q, 0 = band default */
+    float    hr_q;
+    uint8_t  br_stages;   /* identical stages in cascade, 1..4 */
+    uint8_t  hr_stages;
 } bwave_config_t;
 
 void bwave_config_load(bwave_config_t *cfg);

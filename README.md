@@ -70,8 +70,51 @@ esptool.py --chip esp32c6 write_flash 0x9000 provision.bin
 Alternatively put values in a local `firmware/sdkconfig` via `idf.py menuconfig`
 → *BWave Configuration*; that file is git-ignored.
 
+## Resonance measurements (tier 2)
+
+The vital-sign pipeline treats breathing and heartbeat as tuned circuits
+(Radiotron Designer's Handbook ch. 8-9). About once a second it sends a
+48-byte packet, magic `0xC511000F`, and answers the `resonance` command:
+
+| Field | Meaning |
+|---|---|
+| `br` / `hr` `f0`, `q` | Spectral peak of the CSI phase and Q = f0 / (f2 - f1) at the half-power (70.7%) points. High Q = steady rhythm, low Q = irregular or noisy |
+| `res_limited` | The peak is as narrow as the 256-sample (12.8 s) window can resolve, so Q is a lower bound. Breathing Q tops out near 2.2 for this reason |
+| `br_decrement` / `hr_decrement` | Logarithmic decrement per cycle, ln(i / i'). About 0 for a sustained rhythm, > 0 when decaying (for example settling after movement). Exact Q = sqrt(pi^2/delta^2 + 1/4) |
+| `am_br`, `am_depth` | The same breathing peak measured from amplitude (AM), and modulation depth m |
+| `pm_index` | Peak phase deviation in radians in the breathing band (PM) |
+| `am_pm_agree` | AM and PM breathing peaks are within 10% (or one resolution bin) of each other |
+
+A peak counts as valid only when its power is at least 10x the median over
+the scan. On white noise that gives about 1.5% false peaks.
+
+The breathing and heart band-pass filters are designed by centre frequency
+and Q, with 1-4 identical stages in cascade. Overall selectivity is
+(1 + Q^2 Y^2)^(-n/2), where Y = f/f0 - f0/f. By default the filters have
+one stage, with half-power points exactly at the band edges: breathing
+0.1-0.5 Hz (f0 0.224 Hz, Q 0.56), heart 0.8-2.0 Hz (f0 1.265 Hz, Q 1.05).
+Q is per stage, so adding stages narrows the band.
+
+| Setting | Default | Where to set it |
+|---|---|---|
+| Breathing / heart Q x100 | 0 (band default) | NVS `bwave/br_q_x100`, `bwave/hr_q_x100` (u16) or Kconfig |
+| Breathing / heart stages | 1 | NVS `bwave/br_stages`, `bwave/hr_stages` (u8) or Kconfig |
+
+To retune at runtime (not saved across reboots), send
+`{"cmd":"filter","br_q":2.0,"br_stages":2}`. A field left out keeps its
+current value, and a Q of 0 restores the band default.
+
+Host tests for the maths and the DSP pipeline (C compiler and libm only):
+
+```bash
+firmware/test/host/run.sh
+```
+
 ## Interpreter
 
 ```bash
 BWAVE_UDP_PORT=5005 BWAVE_HTTP_PORT=8210 python3 interpreter/bwave_interp.py
 ```
+
+Resonance data is served at `/api/v1/resonance`. `/api/v1/history/{br_q,hr_q,am_depth}`
+gives the recent history of each value.

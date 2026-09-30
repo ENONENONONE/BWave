@@ -132,6 +132,47 @@ static void handle_tunnel_line(const char *line)
     usb_raw_send("!Q,NACK,0,unknown\n");
 }
 
+/* "key": number anywhere in a flat JSON object; false if absent */
+static bool json_num(const char *json, const char *key, float *out)
+{
+    char pat[24];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(json, pat);
+    if (!p) return false;
+    p = strchr(p + strlen(pat), ':');
+    if (!p) return false;
+    char *end;
+    float v = strtof(p + 1, &end);
+    if (end == p + 1) return false;
+    *out = v;
+    return true;
+}
+
+static int res_peak_json(char *buf, size_t len, const char *name,
+                         const bwave_res_peak_t *pk)
+{
+    return snprintf(buf, len,
+        "\"%s\":{\"valid\":%s,\"f0\":%.4f,\"bpm\":%.2f,\"f1\":%.4f,"
+        "\"f2\":%.4f,\"q\":%.2f,\"snr\":%.1f,\"res_limited\":%s}",
+        name, pk->valid ? "true" : "false", pk->f0_hz, pk->f0_hz * 60.0f,
+        pk->f1_hz, pk->f2_hz, pk->q, pk->snr,
+        pk->res_limited ? "true" : "false");
+}
+
+static int filter_json(char *buf, size_t len, const bwave_dsp_filter_t *f)
+{
+    float b1, b2, h1, h2;
+    bwave_res_band_edges(f->br_f0, f->br_q, f->br_stages, &b1, &b2);
+    bwave_res_band_edges(f->hr_f0, f->hr_q, f->hr_stages, &h1, &h2);
+    return snprintf(buf, len,
+        "\"filter\":{\"br\":{\"f0\":%.4f,\"q\":%.3f,\"stages\":%u,"
+        "\"f1\":%.4f,\"f2\":%.4f},"
+        "\"hr\":{\"f0\":%.4f,\"q\":%.3f,\"stages\":%u,"
+        "\"f1\":%.4f,\"f2\":%.4f}}",
+        f->br_f0, f->br_q, f->br_stages, b1, b2,
+        f->hr_f0, f->hr_q, f->hr_stages, h1, h2);
+}
+
 static void handle_cmd(const char *json, char *buf, size_t buflen)
 {
     char cmd[32] = {0};
@@ -444,6 +485,69 @@ static void handle_cmd(const char *json, char *buf, size_t buflen)
         }
         o += snprintf(buf + o, buflen - o, "]}\n");
 
+    } else if (strcmp(cmd, "resonance") == 0) {
+        bwave_dsp_resonance_t r;
+        bwave_dsp_filter_t f;
+        bwave_dsp_get_filter(&f);
+        if (!bwave_dsp_get_resonance(&r)) {
+            int o = snprintf(buf, buflen,
+                "{\"ok\":true,\"cmd\":\"resonance\",\"ready\":false,");
+            o += filter_json(buf + o, buflen - o, &f);
+            snprintf(buf + o, buflen - o, "}\n");
+        } else {
+            /* eq. 24: how far each filter passes the other band's rhythm */
+            float hr_at_br = r.br.valid
+                ? 20.0f * log10f(bwave_res_selectivity(r.br.f0_hz, f.hr_f0, f.hr_q, f.hr_stages) + 1e-9f) : 0.0f;
+            float br_at_hr = r.hr.valid
+                ? 20.0f * log10f(bwave_res_selectivity(r.hr.f0_hz, f.br_f0, f.br_q, f.br_stages) + 1e-9f) : 0.0f;
+            int o = snprintf(buf, buflen,
+                "{\"ok\":true,\"cmd\":\"resonance\",\"ready\":true,"
+                "\"n\":%u,\"age_ms\":%lu,",
+                (unsigned)r.n_samples,
+                (unsigned long)((uint32_t)(esp_timer_get_time() / 1000) - r.updated_ms));
+            o += res_peak_json(buf + o, buflen - o, "br", &r.br);
+            buf[o++] = ',';
+            o += res_peak_json(buf + o, buflen - o, "hr", &r.hr);
+            buf[o++] = ',';
+            o += res_peak_json(buf + o, buflen - o, "am_br", &r.am_br);
+            o += snprintf(buf + o, buflen - o,
+                ",\"br_decrement\":%.4f,\"br_q_decrement\":%.2f,\"br_cycles\":%u,"
+                "\"hr_decrement\":%.4f,\"hr_q_decrement\":%.2f,\"hr_cycles\":%u,"
+                "\"am_depth\":%.4f,\"pm_index\":%.4f,\"am_pm_agree\":%s,"
+                "\"hr_filter_at_br_db\":%.1f,\"br_filter_at_hr_db\":%.1f,",
+                r.br_decrement, bwave_res_q_from_decrement(r.br_decrement), r.br_cycles,
+                r.hr_decrement, bwave_res_q_from_decrement(r.hr_decrement), r.hr_cycles,
+                r.am_depth, r.pm_index, r.am_pm_agree ? "true" : "false",
+                hr_at_br, br_at_hr);
+            o += filter_json(buf + o, buflen - o, &f);
+            snprintf(buf + o, buflen - o, "}\n");
+        }
+
+    } else if (strcmp(cmd, "filter") == 0) {
+        /* {"cmd":"filter","br_q":2.0,"hr_q":0,"br_stages":2}
+           omitted = keep, q 0 = band default; not persisted (use NVS) */
+        float br_q = -1.0f, hr_q = -1.0f, bs = 0.0f, hs = 0.0f;
+        json_num(json, "br_q", &br_q);
+        json_num(json, "hr_q", &hr_q);
+        json_num(json, "br_stages", &bs);
+        json_num(json, "hr_stages", &hs);
+        if ((br_q > 0.0f && br_q < 0.05f) || br_q > 50.0f ||
+            (hr_q > 0.0f && hr_q < 0.05f) || hr_q > 50.0f ||
+            bs < 0.0f || bs > BWAVE_RES_MAX_STAGES ||
+            hs < 0.0f || hs > BWAVE_RES_MAX_STAGES) {
+            snprintf(buf, buflen,
+                "{\"ok\":false,\"cmd\":\"filter\","
+                "\"err\":\"q must be 0 or 0.05-50, stages 1-%d\"}\n",
+                BWAVE_RES_MAX_STAGES);
+        } else {
+            bwave_dsp_set_filter(br_q, hr_q, (uint8_t)bs, (uint8_t)hs);
+            bwave_dsp_filter_t f;
+            bwave_dsp_get_filter(&f);
+            int o = snprintf(buf, buflen, "{\"ok\":true,\"cmd\":\"filter\",");
+            o += filter_json(buf + o, buflen - o, &f);
+            snprintf(buf + o, buflen - o, "}\n");
+        }
+
     } else if (strcmp(cmd, "csi_macs") == 0) {
         uint8_t macs[32][6];
         int8_t  rssi[32];
@@ -597,7 +701,8 @@ static void handle_cmd(const char *json, char *buf, size_t buflen)
             "\"ssid\":\"%s\",\"target\":\"%s:%u\","
             "\"node\":%u,\"ch\":%u,\"tier\":%u,"
             "\"vital_ms\":%u,\"presence_thresh\":%.2f,"
-            "\"top_k\":%u,\"sd\":%u,\"lcd\":%u}\n",
+            "\"top_k\":%u,\"sd\":%u,\"lcd\":%u,"
+            "\"br_q\":%.2f,\"hr_q\":%.2f,\"br_stages\":%u,\"hr_stages\":%u}\n",
             g_bwave_config.wifi_ssid,
             g_bwave_config.target_ip, g_bwave_config.target_port,
             g_bwave_config.node_id, g_bwave_config.wifi_channel,
@@ -606,7 +711,9 @@ static void handle_cmd(const char *json, char *buf, size_t buflen)
             g_bwave_config.presence_thresh,
             g_bwave_config.top_k_count,
             g_bwave_config.sd_logging,
-            g_bwave_config.lcd_enabled);
+            g_bwave_config.lcd_enabled,
+            g_bwave_config.br_q, g_bwave_config.hr_q,
+            g_bwave_config.br_stages, g_bwave_config.hr_stages);
 
     } else if (strcmp(cmd, "lcd") == 0) {
         const bwave_declared_t *d = bwave_lcd_get_declared();

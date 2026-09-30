@@ -46,6 +46,19 @@ static int load_nvs_ns(bwave_config_t *cfg, const char *ns, bool with_node_id)
     if (with_node_id && nvs_get_u8(handle, "node_id", &u8_val) == ESP_OK)
         cfg->node_id = u8_val;
 
+    /* vital filter tuning: BWave namespace only */
+    if (with_node_id) {
+        uint16_t q_val;
+        if (nvs_get_u16(handle, "br_q_x100", &q_val) == ESP_OK)
+            cfg->br_q = (float)q_val / 100.0f;
+        if (nvs_get_u16(handle, "hr_q_x100", &q_val) == ESP_OK)
+            cfg->hr_q = (float)q_val / 100.0f;
+        if (nvs_get_u8(handle, "br_stages", &u8_val) == ESP_OK && u8_val > 0)
+            cfg->br_stages = u8_val;
+        if (nvs_get_u8(handle, "hr_stages", &u8_val) == ESP_OK && u8_val > 0)
+            cfg->hr_stages = u8_val;
+    }
+
     nvs_close(handle);
     return 1;
 }
@@ -73,6 +86,10 @@ void bwave_config_load(bwave_config_t *cfg)
     cfg->vital_interval_ms = (uint16_t)CONFIG_BWAVE_VITAL_INTERVAL_MS;
     cfg->presence_thresh = 0.0f;
     cfg->top_k_count = 8;
+    cfg->br_q = (float)CONFIG_BWAVE_BR_Q_X100 / 100.0f;
+    cfg->hr_q = (float)CONFIG_BWAVE_HR_Q_X100 / 100.0f;
+    cfg->br_stages = (uint8_t)CONFIG_BWAVE_BR_STAGES;
+    cfg->hr_stages = (uint8_t)CONFIG_BWAVE_HR_STAGES;
 
 #ifdef CONFIG_BWAVE_SD_LOGGING
     cfg->sd_logging = 1;

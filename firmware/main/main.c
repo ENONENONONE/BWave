@@ -199,6 +199,10 @@ void app_main(void)
         .presence_thresh = g_bwave_config.presence_thresh,
         .vital_interval_ms = g_bwave_config.vital_interval_ms,
         .top_k_count = g_bwave_config.top_k_count,
+        .br_q = g_bwave_config.br_q,
+        .hr_q = g_bwave_config.hr_q,
+        .br_stages = g_bwave_config.br_stages,
+        .hr_stages = g_bwave_config.hr_stages,
     };
     bwave_dsp_init(&dsp_cfg);
 

@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "esp_err.h"
+#include "bwave_resonance.h"
 
 #define DSP_RING_SLOTS       16
 #define DSP_MAX_IQ_BYTES     1024
@@ -24,6 +25,7 @@ typedef struct {
 #define BWAVE_PERSON_MAGIC   0xC511000A
 #define BWAVE_DOPPLER_MAGIC  0xC511000E
 #define BWAVE_BASELINE_MAGIC 0xC5110008
+#define BWAVE_RESONANCE_MAGIC 0xC511000F
 
 #define BWAVE_MAX_PERSONS    4
 #define BWAVE_BASELINE_MAX_SC 256
@@ -98,12 +100,70 @@ typedef struct __attribute__((packed)) {
 
 _Static_assert(sizeof(bwave_doppler_pkt_t) == 40, "doppler packet must be 40 bytes");
 
+/* Resonance packet (48 bytes), sent about once a second at tier 2.
+ * flags: bit0 br valid, bit1 hr valid, bit2 am valid,
+ *        bit3 br Q resolution-limited, bit4 hr Q resolution-limited,
+ *        bit5 AM and PM breathing agree, bit6 am Q resolution-limited */
+#define BWAVE_RES_F_BR_VALID   0x01
+#define BWAVE_RES_F_HR_VALID   0x02
+#define BWAVE_RES_F_AM_VALID   0x04
+#define BWAVE_RES_F_BR_RESLIM  0x08
+#define BWAVE_RES_F_HR_RESLIM  0x10
+#define BWAVE_RES_F_AGREE      0x20
+#define BWAVE_RES_F_AM_RESLIM  0x40
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint8_t  node_id;
+    uint8_t  flags;
+    uint16_t timestamp_ms;
+    float    br_f0_hz;      /* phase (PM) breathing peak */
+    float    br_q;          /* f0 / half-power bandwidth */
+    float    hr_f0_hz;
+    float    hr_q;
+    float    br_decrement;  /* log decrement per cycle, breathing band */
+    float    hr_decrement;
+    float    am_depth;      /* AM modulation depth m, breathing band */
+    float    pm_index;      /* peak phase deviation (rad), breathing band */
+    float    am_br_f0_hz;   /* amplitude (AM) breathing peak */
+    float    am_br_q;
+} bwave_resonance_pkt_t;
+
+_Static_assert(sizeof(bwave_resonance_pkt_t) == 48, "resonance packet must be 48 bytes");
+
+typedef struct {
+    bwave_res_peak_t br;      /* from phase */
+    bwave_res_peak_t hr;      /* from phase */
+    bwave_res_peak_t am_br;   /* from amplitude */
+    float    br_decrement;
+    float    hr_decrement;
+    uint8_t  br_cycles;
+    uint8_t  hr_cycles;
+    float    am_depth;
+    float    pm_index;
+    bool     am_pm_agree;
+    uint16_t n_samples;
+    uint32_t updated_ms;
+} bwave_dsp_resonance_t;
+
+/* Vital-sign band-pass filters: n identical stages at centre f0, per-stage Q */
+typedef struct {
+    float   br_f0, br_q;
+    uint8_t br_stages;
+    float   hr_f0, hr_q;
+    uint8_t hr_stages;
+} bwave_dsp_filter_t;
+
 typedef struct {
     uint8_t  tier;
     float    presence_thresh;
     float    fall_thresh;
     uint16_t vital_interval_ms;
     uint8_t  top_k_count;
+    float    br_q;        /* 0 = Q of the 0.1-0.5 Hz band */
+    float    hr_q;        /* 0 = Q of the 0.8-2.0 Hz band */
+    uint8_t  br_stages;   /* 1..4, 0 = 1 */
+    uint8_t  hr_stages;
 } bwave_dsp_config_t;
 
 esp_err_t bwave_dsp_init(const bwave_dsp_config_t *cfg);
@@ -125,5 +185,13 @@ void  bwave_dsp_get_features(float *features, int *count);
 bool  bwave_dsp_get_fall(void);
 float bwave_dsp_get_presence(void);
 void  bwave_dsp_get_baseline(float *baseline, int *count);
+
+/* false until the first resonance measurement */
+bool  bwave_dsp_get_resonance(bwave_dsp_resonance_t *out);
+void  bwave_dsp_get_filter(bwave_dsp_filter_t *out);
+/* Applied by the DSP task on its next frame. q < 0 or stages 0 keeps the
+ * current value; q == 0 restores the band default. */
+void  bwave_dsp_set_filter(float br_q, float hr_q,
+                           uint8_t br_stages, uint8_t hr_stages);
 
 #endif

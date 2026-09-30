@@ -86,6 +86,30 @@ static inline float biquad_process(bwave_biquad_t *bq, float x)
     return y;
 }
 
+/* n identical band-pass stages in cascade (ch. 9 sect. 9) */
+typedef struct {
+    bwave_biquad_t st[BWAVE_RES_MAX_STAGES];
+    uint8_t n;
+} bq_cascade_t;
+
+static inline float cascade_process(bq_cascade_t *c, float x)
+{
+    for (uint8_t i = 0; i < c->n; i++) x = biquad_process(&c->st[i], x);
+    return x;
+}
+
+/* Swap coefficients, keep running state so a retune does not restart the filter */
+static void cascade_set(bq_cascade_t *c, const bwave_res_bq_coef_t *k, uint8_t n)
+{
+    for (uint8_t i = 0; i < BWAVE_RES_MAX_STAGES; i++) {
+        bwave_biquad_t *b = &c->st[i];
+        b->b0 = k->b0; b->b1 = k->b1; b->b2 = k->b2;
+        b->a1 = k->a1; b->a2 = k->a2;
+        if (i >= c->n) b->x1 = b->x2 = b->y1 = b->y2 = 0.0f;
+    }
+    c->n = n;
+}
+
 /* Phase extraction */
 static inline float extract_phase(const uint8_t *iq, uint16_t idx)
 {
@@ -162,7 +186,7 @@ static uint8_t s_top_k_count;
 static float s_phase_history[DSP_PHASE_HISTORY];
 static uint16_t s_hist_len, s_hist_idx;
 
-static bwave_biquad_t s_bq_br, s_bq_hr;
+static bq_cascade_t s_bq_br, s_bq_hr;
 static bwave_biquad_t s_bq_delta, s_bq_theta, s_bq_alpha;
 
 static float s_delta_energy, s_theta_energy, s_alpha_energy;
@@ -201,8 +225,8 @@ typedef struct {
 } bwave_person_vitals_t;
 
 static bwave_person_vitals_t s_persons[BWAVE_MAX_PERSONS];
-static bwave_biquad_t s_person_bq_br[BWAVE_MAX_PERSONS];
-static bwave_biquad_t s_person_bq_hr[BWAVE_MAX_PERSONS];
+static bq_cascade_t s_person_bq_br[BWAVE_MAX_PERSONS];
+static bq_cascade_t s_person_bq_hr[BWAVE_MAX_PERSONS];
 static float s_person_br_filt[BWAVE_MAX_PERSONS][DSP_PHASE_HISTORY];
 static float s_person_hr_filt[BWAVE_MAX_PERSONS][DSP_PHASE_HISTORY];
 static float s_person_breath_ref[BWAVE_MAX_PERSONS];
@@ -224,6 +248,154 @@ static int64_t s_fall_last_alert_us;
 static float s_amp_baseline[BWAVE_BASELINE_MAX_SC];
 static bool  s_amp_baseline_valid;
 static int64_t s_last_baseline_send_us;
+
+/* Vital bands */
+#define DSP_FS        20.0f
+#define BR_BAND_LO    0.1f
+#define BR_BAND_HI    0.5f
+#define HR_BAND_LO    0.8f
+#define HR_BAND_HI    2.0f
+
+/* Resonance (tuned-circuit) measurements */
+#define RES_INTERVAL_US  (1000000LL)
+#define RES_MIN_SAMPLES  128
+static float s_amp_history[DSP_PHASE_HISTORY];   /* primary subcarrier, / baseline */
+static float s_am_filt[DSP_PHASE_HISTORY];
+static bq_cascade_t s_bq_am;
+static float s_res_buf[DSP_PHASE_HISTORY];
+static bwave_dsp_resonance_t s_res;
+static volatile bool s_res_valid;
+static int64_t s_last_res_us;
+
+static bwave_dsp_filter_t s_filt;
+static bwave_dsp_filter_t s_filt_req;
+static volatile bool s_filt_pending;
+
+static uint8_t clamp_stages(uint8_t n)
+{
+    if (n < 1) return 1;
+    return n > BWAVE_RES_MAX_STAGES ? BWAVE_RES_MAX_STAGES : n;
+}
+
+/* Design every vital filter from s_filt (DSP task, or init before it runs) */
+static void apply_filter(void)
+{
+    bwave_res_bq_coef_t br, hr;
+    bwave_res_bandpass(DSP_FS, s_filt.br_f0, s_filt.br_q, &br);
+    bwave_res_bandpass(DSP_FS, s_filt.hr_f0, s_filt.hr_q, &hr);
+    cascade_set(&s_bq_br, &br, s_filt.br_stages);
+    cascade_set(&s_bq_hr, &hr, s_filt.hr_stages);
+    cascade_set(&s_bq_am, &br, s_filt.br_stages);
+    for (uint8_t p = 0; p < BWAVE_MAX_PERSONS; p++) {
+        cascade_set(&s_person_bq_br[p], &br, s_filt.br_stages);
+        cascade_set(&s_person_bq_hr[p], &hr, s_filt.hr_stages);
+    }
+    ESP_LOGI(TAG, "filters: br f0=%.3f Q=%.2f x%u, hr f0=%.3f Q=%.2f x%u",
+             s_filt.br_f0, s_filt.br_q, s_filt.br_stages,
+             s_filt.hr_f0, s_filt.hr_q, s_filt.hr_stages);
+}
+
+static void resolve_filter(bwave_dsp_filter_t *f, float br_q, float hr_q,
+                           uint8_t br_stages, uint8_t hr_stages)
+{
+    float br_def = bwave_res_band_q(BR_BAND_LO, BR_BAND_HI, &f->br_f0);
+    float hr_def = bwave_res_band_q(HR_BAND_LO, HR_BAND_HI, &f->hr_f0);
+    if (br_q == 0.0f)     f->br_q = br_def;
+    else if (br_q > 0.0f) f->br_q = br_q;
+    if (hr_q == 0.0f)     f->hr_q = hr_def;
+    else if (hr_q > 0.0f) f->hr_q = hr_q;
+    if (br_stages) f->br_stages = clamp_stages(br_stages);
+    if (hr_stages) f->hr_stages = clamp_stages(hr_stages);
+}
+
+/* Ring buffer (length len ending at head) -> contiguous, oldest first */
+static void ring_copy(float *dst, const float *ring, uint16_t head, uint16_t len)
+{
+    for (uint16_t i = 0; i < len; i++)
+        dst[i] = ring[(head + DSP_PHASE_HISTORY - len + i) % DSP_PHASE_HISTORY];
+}
+
+/* Peak of the band signal divided by the filter's gain at f (eq. 24, n stages) */
+static float band_peak(const float *x, uint16_t n, float f, float f0, float q, uint8_t stages)
+{
+    float pk = bwave_res_sine_peak(x, n);
+    float g = (f > 0.0f) ? bwave_res_selectivity(f, f0, q, stages) : 1.0f;
+    return (g > 0.2f) ? pk / g : pk;
+}
+
+static void compute_resonance(void)
+{
+    uint16_t n = s_hist_len;
+    if (n < RES_MIN_SAMPLES) return;
+    bwave_dsp_resonance_t r;
+    memset(&r, 0, sizeof(r));
+    r.n_samples = n;
+
+    /* phase spectrum: breathing and heart peaks, Q = f0 / (f2 - f1) */
+    ring_copy(s_res_buf, s_phase_history, s_hist_idx, n);
+    bwave_res_prepare(s_res_buf, n);
+    bwave_res_peak(s_res_buf, n, DSP_FS, 0.05f, 0.8f, 0.1f, 40.0f / 60.0f, &r.br);
+    bwave_res_peak(s_res_buf, n, DSP_FS, 0.6f, 3.2f, 40.0f / 60.0f, 3.0f, &r.hr);
+
+    /* amplitude spectrum and AM depth */
+    ring_copy(s_res_buf, s_amp_history, s_hist_idx, n);
+    float carrier = 0.0f;
+    for (uint16_t i = 0; i < n; i++) carrier += s_res_buf[i];
+    carrier /= (float)n;
+    bwave_res_prepare(s_res_buf, n);
+    bwave_res_peak(s_res_buf, n, DSP_FS, 0.05f, 0.8f, 0.1f, 40.0f / 60.0f, &r.am_br);
+
+    ring_copy(s_res_buf, s_am_filt, s_hist_idx, n);
+    if (carrier > 0.0f)
+        r.am_depth = band_peak(s_res_buf, n, r.am_br.valid ? r.am_br.f0_hz : 0.0f,
+                               s_filt.br_f0, s_filt.br_q, s_filt.br_stages) / carrier;
+
+    /* breathing band: PM index and decrement */
+    ring_copy(s_res_buf, s_br_filt, s_hist_idx, n);
+    r.pm_index = band_peak(s_res_buf, n, r.br.valid ? r.br.f0_hz : 0.0f,
+                           s_filt.br_f0, s_filt.br_q, s_filt.br_stages);
+    r.br_decrement = bwave_res_log_decrement(s_res_buf, n, &r.br_cycles);
+
+    ring_copy(s_res_buf, s_hr_filt, s_hist_idx, n);
+    r.hr_decrement = bwave_res_log_decrement(s_res_buf, n, &r.hr_cycles);
+
+    if (r.br.valid && r.am_br.valid) {
+        float tol = fmaxf(0.1f * r.br.f0_hz, DSP_FS / (float)n);
+        r.am_pm_agree = fabsf(r.am_br.f0_hz - r.br.f0_hz) <= tol;
+    }
+    r.updated_ms = (uint32_t)(esp_timer_get_time() / 1000);
+
+    s_res = r;
+    s_res_valid = true;
+}
+
+static void send_resonance(void)
+{
+    bwave_resonance_pkt_t pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.magic = BWAVE_RESONANCE_MAGIC;
+    pkt.node_id = bwave_csi_get_node_id();
+    pkt.timestamp_ms = (uint16_t)((esp_timer_get_time() / 1000) & 0xFFFF);
+    const bwave_dsp_resonance_t *r = &s_res;
+    pkt.flags = (r->br.valid ? BWAVE_RES_F_BR_VALID : 0)
+              | (r->hr.valid ? BWAVE_RES_F_HR_VALID : 0)
+              | (r->am_br.valid ? BWAVE_RES_F_AM_VALID : 0)
+              | (r->br.res_limited ? BWAVE_RES_F_BR_RESLIM : 0)
+              | (r->hr.res_limited ? BWAVE_RES_F_HR_RESLIM : 0)
+              | (r->am_pm_agree ? BWAVE_RES_F_AGREE : 0)
+              | (r->am_br.res_limited ? BWAVE_RES_F_AM_RESLIM : 0);
+    pkt.br_f0_hz = r->br.f0_hz;
+    pkt.br_q = r->br.q;
+    pkt.hr_f0_hz = r->hr.f0_hz;
+    pkt.hr_q = r->hr.q;
+    pkt.br_decrement = r->br_decrement;
+    pkt.hr_decrement = r->hr_decrement;
+    pkt.am_depth = r->am_depth;
+    pkt.pm_index = r->pm_index;
+    pkt.am_br_f0_hz = r->am_br.f0_hz;
+    pkt.am_br_q = r->am_br.q;
+    bwave_stream_send((const uint8_t *)&pkt, sizeof(pkt));
+}
 
 /* Top-K selection */
 static void update_top_k(uint16_t n_sub)
@@ -435,8 +607,8 @@ static void update_multi_person(const uint8_t *iq_data, uint16_t n_sc, float sam
         pv->history_idx = (pv->history_idx + 1) % DSP_PHASE_HISTORY;
         if (pv->history_len < DSP_PHASE_HISTORY) pv->history_len++;
 
-        float br_val = biquad_process(&s_person_bq_br[p], avg_phase);
-        float hr_val = biquad_process(&s_person_bq_hr[p], avg_phase);
+        float br_val = cascade_process(&s_person_bq_br[p], avg_phase);
+        float hr_val = cascade_process(&s_person_bq_hr[p], avg_phase);
 
         uint16_t idx = (pv->history_idx + DSP_PHASE_HISTORY - 1) % DSP_PHASE_HISTORY;
         s_person_br_filt[p][idx] = br_val;
@@ -468,9 +640,15 @@ static void process_frame(const dsp_ring_slot_t *slot)
     uint16_t n_sub = slot->iq_len / 2;
     if (n_sub == 0 || n_sub > DSP_MAX_SUBCARRIERS) return;
 
+    if (s_filt_pending) {
+        s_filt = s_filt_req;
+        s_filt_pending = false;
+        apply_filter();
+    }
+
     s_frame_count++;
     s_latest_rssi = slot->rssi;
-    const float sample_rate = 20.0f;
+    const float sample_rate = DSP_FS;
 
     /* Phase extraction + unwrapping */
     float phases[DSP_MAX_SUBCARRIERS];
@@ -514,12 +692,25 @@ static void process_frame(const dsp_ring_slot_t *slot)
     float primary = phases[s_top_k[0]];
 
     s_phase_history[s_hist_idx] = primary;
+
+    /* primary subcarrier amplitude relative to its baseline (AM carrier ~1) */
+    {
+        uint8_t sc = s_top_k[0];
+        int8_t i_val = (int8_t)slot->iq_data[2 * sc];
+        int8_t q_val = (int8_t)slot->iq_data[2 * sc + 1];
+        float a = sqrtf((float)(i_val * i_val + q_val * q_val));
+        float base = s_amp_baseline[sc];   /* sc < n_sub <= BWAVE_BASELINE_MAX_SC */
+        s_amp_history[s_hist_idx] = (base > 0.5f) ? a / base : 1.0f;
+    }
+    float am_raw = s_amp_history[s_hist_idx];
+
     s_hist_idx = (s_hist_idx + 1) % DSP_PHASE_HISTORY;
     if (s_hist_len < DSP_PHASE_HISTORY) s_hist_len++;
 
     /* Bandpass filtering */
-    float br_val = biquad_process(&s_bq_br, primary);
-    float hr_val = biquad_process(&s_bq_hr, primary);
+    float br_val = cascade_process(&s_bq_br, primary);
+    float hr_val = cascade_process(&s_bq_hr, primary);
+    float am_val = cascade_process(&s_bq_am, am_raw);
 
     /* Brainwave band energy */
     float dv = biquad_process(&s_bq_delta, primary);
@@ -532,6 +723,7 @@ static void process_frame(const dsp_ring_slot_t *slot)
     uint16_t filt_idx = (s_hist_idx + DSP_PHASE_HISTORY - 1) % DSP_PHASE_HISTORY;
     s_br_filt[filt_idx] = br_val;
     s_hr_filt[filt_idx] = hr_val;
+    s_am_filt[filt_idx] = am_val;
 
     /* BPM estimation */
     if (s_hist_len >= 64) {
@@ -602,6 +794,16 @@ static void process_frame(const dsp_ring_slot_t *slot)
 
     /* Multi-person vitals */
     update_multi_person(slot->iq_data, n_sub, sample_rate);
+
+    /* Resonance: at most once a second, full tier only (soft-float cost) */
+    if (s_cfg.tier >= 2) {
+        int64_t res_now = esp_timer_get_time();
+        if ((res_now - s_last_res_us) >= RES_INTERVAL_US && s_hist_len >= RES_MIN_SAMPLES) {
+            compute_resonance();
+            send_resonance();
+            s_last_res_us = res_now;
+        }
+    }
 
     /* Send vitals at interval */
     int64_t now_us = esp_timer_get_time();
@@ -755,6 +957,28 @@ void bwave_dsp_get_baseline(float *baseline, int *count)
     if (count) *count = s_amp_baseline_valid ? BWAVE_BASELINE_MAX_SC : 0;
 }
 
+bool bwave_dsp_get_resonance(bwave_dsp_resonance_t *out)
+{
+    if (!out || !s_res_valid) return false;
+    memcpy(out, &s_res, sizeof(*out));
+    return true;
+}
+
+void bwave_dsp_get_filter(bwave_dsp_filter_t *out)
+{
+    if (out) *out = s_filt_pending ? s_filt_req : s_filt;
+}
+
+void bwave_dsp_set_filter(float br_q, float hr_q,
+                          uint8_t br_stages, uint8_t hr_stages)
+{
+    bwave_dsp_filter_t f = s_filt_pending ? s_filt_req : s_filt;
+    resolve_filter(&f, br_q, hr_q, br_stages, hr_stages);
+    s_filt_req = f;
+    __sync_synchronize();
+    s_filt_pending = true;
+}
+
 void bwave_dsp_init_temperature(void)
 {
 #ifdef CONFIG_SOC_TEMP_SENSOR_SUPPORTED
@@ -801,16 +1025,27 @@ esp_err_t bwave_dsp_init(const bwave_dsp_config_t *cfg)
     s_amp_baseline_valid = false;
     s_last_baseline_send_us = 0;
 
-    const float fs = 20.0f;
-    biquad_design(&s_bq_br, fs, 0.1f, 0.5f);
-    biquad_design(&s_bq_hr, fs, 0.8f, 2.0f);
+    const float fs = DSP_FS;
+    memset(&s_bq_br, 0, sizeof(s_bq_br));
+    memset(&s_bq_hr, 0, sizeof(s_bq_hr));
+    memset(&s_bq_am, 0, sizeof(s_bq_am));
+    memset(s_person_bq_br, 0, sizeof(s_person_bq_br));
+    memset(s_person_bq_hr, 0, sizeof(s_person_bq_hr));
+    memset(&s_filt, 0, sizeof(s_filt));
+    resolve_filter(&s_filt, s_cfg.br_q, s_cfg.hr_q,
+                   s_cfg.br_stages ? s_cfg.br_stages : 1,
+                   s_cfg.hr_stages ? s_cfg.hr_stages : 1);
+    s_filt_pending = false;
+    apply_filter();
+    memset(s_amp_history, 0, sizeof(s_amp_history));
+    memset(s_am_filt, 0, sizeof(s_am_filt));
+    memset(&s_res, 0, sizeof(s_res));
+    s_res_valid = false;
+    s_last_res_us = 0;
+
     biquad_design(&s_bq_delta, fs, 0.5f, 4.0f);
     biquad_design(&s_bq_theta, fs, 4.0f, 8.0f);
     biquad_design(&s_bq_alpha, fs, 8.0f, 9.5f);
-    for (uint8_t p = 0; p < BWAVE_MAX_PERSONS; p++) {
-        biquad_design(&s_person_bq_br[p], fs, 0.1f, 0.5f);
-        biquad_design(&s_person_bq_hr[p], fs, 0.8f, 2.0f);
-    }
 
     if (s_cfg.tier == 0) {
         ESP_LOGI(TAG, "Tier 0: raw passthrough");

@@ -4,6 +4,7 @@ idf_component_register(
         "bwave_config.c"
         "bwave_csi.c"
         "bwave_dsp.c"
+        "bwave_resonance.c"
         "bwave_stream.c"
         "bwave_sd.c"
         "bwave_lcd.c"

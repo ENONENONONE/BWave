@@ -36,6 +36,38 @@ menu "BWave Configuration"
         default 1000
         range 100 10000
 
+    config BWAVE_BR_Q_X100
+        int "Breathing filter Q x100 (0 = band default)"
+        default 0
+        range 0 5000
+        help
+            Per-stage magnification factor of the breathing band-pass filter,
+            times 100. 0 uses the Q whose half-power points are 0.1 and
+            0.5 Hz (f0 = 0.224 Hz, Q = 0.56). NVS "bwave/br_q_x100" overrides.
+
+    config BWAVE_HR_Q_X100
+        int "Heart filter Q x100 (0 = band default)"
+        default 0
+        range 0 5000
+        help
+            As BWAVE_BR_Q_X100 for the 0.8-2.0 Hz heart band
+            (f0 = 1.265 Hz, Q = 1.05). NVS "bwave/hr_q_x100" overrides.
+
+    config BWAVE_BR_STAGES
+        int "Breathing filter stages in cascade"
+        default 1
+        range 1 4
+        help
+            n identical stages; selectivity (1 + Q^2 Y^2)^(-n/2).
+            NVS "bwave/br_stages" overrides.
+
+    config BWAVE_HR_STAGES
+        int "Heart filter stages in cascade"
+        default 1
+        range 1 4
+        help
+            NVS "bwave/hr_stages" overrides.
+
     config BWAVE_SD_LOGGING
         bool "Enable SD card logging"
         default y
